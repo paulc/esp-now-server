@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
         .set_exclusive(false)
         .expect("Unable to set serial port exclusive to false");
 
-    let mut framed = Framed::new(serial, esp_codec::EspCodec::new());
+    let mut framed = Framed::new(serial, framed_codec::FramedBinaryCodec::new());
 
     tokio::spawn(async move {
         loop {
@@ -44,21 +44,23 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-mod esp_codec {
+mod framed_codec {
 
     use bytes::{Buf, BytesMut};
     use tokio_util::codec::Decoder;
 
-    pub const HEADER_LEN: usize = 6; // [0x00, 0xff, 0x00, 0xff, len0, len1]
-    pub static START: [u8; 4] = [0x00_u8, 0xff_u8, 0x00_u8, 0xff_u8];
+    // Binary data header is [start0, start1, start2, start3, len0, len1]
+    // (start is 4-byte pattern, len is 2-byte u16 le encoded)
+    pub const HEADER_LEN: usize = 6;
+    pub static START_PATTERN: [u8; 4] = [0x00_u8, 0xff_u8, 0x00_u8, 0xff_u8];
 
     #[derive(Debug)]
-    pub struct EspCodec {
+    pub struct FramedBinaryCodec {
         pkt_start: bool,
         pkt_len: usize,
     }
 
-    impl EspCodec {
+    impl FramedBinaryCodec {
         pub fn new() -> Self {
             Self {
                 pkt_start: false,
@@ -67,7 +69,7 @@ mod esp_codec {
         }
     }
 
-    impl Decoder for EspCodec {
+    impl Decoder for FramedBinaryCodec {
         type Item = Vec<u8>;
         type Error = std::io::Error;
 
@@ -86,7 +88,7 @@ mod esp_codec {
                         Ok(None)
                     }
                 }
-                false => match src.windows(4).position(|w| w == START) {
+                false => match src.windows(4).position(|w| w == START_PATTERN) {
                     // Look for START flag
                     Some(i) => {
                         // Advance to START
