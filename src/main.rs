@@ -1,10 +1,11 @@
 use std::env;
 
-// use futures_util::sink::SinkExt;
+use futures_util::sink::SinkExt;
 use tokio_serial::SerialPortBuilderExt;
 use tokio_stream::StreamExt;
 use tokio_util::codec::Framed;
 
+use esp_now_server::framed_codec::FramedBinaryCodec;
 use sensor_message::SensorMessage;
 
 #[tokio::main]
@@ -25,18 +26,27 @@ async fn main() -> anyhow::Result<()> {
         .set_exclusive(false)
         .expect("Unable to set serial port exclusive to false");
 
-    let mut framed = Framed::new(serial, framed_codec::FramedBinaryCodec::new());
+    let mut framed = Framed::new(serial, FramedBinaryCodec::new());
 
     tokio::spawn(async move {
+        let mut counter = 0_u32;
         loop {
             match framed.try_next().await {
-                Ok(Some(pkt)) => match postcard::from_bytes::<SensorMessage>(&pkt) {
-                    Ok(data) => println!(">> Data: {:?}", data),
-                    Err(e) => eprintln!(">> Postcard Error: {e:?}"),
-                },
+                Ok(Some(pkt)) => {
+                    match postcard::from_bytes::<SensorMessage>(&pkt) {
+                        Ok(data) => println!(">> Data: {:?}", data),
+                        Err(e) => eprintln!(">> Postcard Error: {e:?}"),
+                    }
+                    let reply = counter.to_be_bytes();
+                    match framed.send(&reply).await {
+                        Ok(_) => println!(">> Sent Reply: {reply:?}"),
+                        Err(e) => eprintln!(">> Error Sending Data: {e:?}"),
+                    }
+                }
                 Ok(None) => {}
                 Err(e) => eprintln!("ERR: {e}"),
             }
+            counter += 1;
         }
     });
 
@@ -44,15 +54,25 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/*
 mod framed_codec {
 
     use bytes::{Buf, BytesMut};
-    use tokio_util::codec::Decoder;
+    use tokio_util::codec::{Decoder, Encoder};
 
     // Binary data header is [start0, start1, start2, start3, len0, len1]
     // (start is 4-byte pattern, len is 2-byte u16 le encoded)
-    pub const HEADER_LEN: usize = 6;
-    pub static START_PATTERN: [u8; 4] = [0x00_u8, 0xff_u8, 0x00_u8, 0xff_u8];
+    pub const FRAME_HEADER_LEN: usize = 3;
+    pub static START_PATTERN: [u8; 2] = [0xAA, 0xCC];
+    pub static MAX_DATA_LEN: usize = 255;
+
+    struct FrameHeader([u8; FRAME_HEADER_LEN]);
+
+    impl FrameHeader {
+        pub fn new(len: u8) -> Self {
+            Self([0xAA, 0xCC, len])
+        }
+    }
 
     #[derive(Debug)]
     pub struct FramedBinaryCodec {
@@ -69,17 +89,40 @@ mod framed_codec {
         }
     }
 
+    impl Encoder<&[u8]> for FramedBinaryCodec {
+        type Error = std::io::Error;
+
+        fn encode(&mut self, item: &[u8], dst: &mut BytesMut) -> Result<(), Self::Error> {
+            if item.len() > MAX_DATA_LEN {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Frame of length {} is too large.", item.len()),
+                ));
+            }
+
+            dst.reserve(FRAME_HEADER_LEN + item.len());
+            let hdr = FrameHeader::new(item.len() as u8);
+            dst.extend_from_slice(&hdr.0);
+            dst.extend_from_slice(item);
+
+            Ok(())
+        }
+    }
+
     impl Decoder for FramedBinaryCodec {
         type Item = Vec<u8>;
         type Error = std::io::Error;
 
         fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+            // println!(
+            //     ">> {:?}\n>> pkt_start={} pkt_len={}",
+            //     src, self.pkt_start, self.pkt_len
+            // );
             match self.pkt_start {
                 true => {
                     // Binary message - check if we have enough bytes
                     if src.len() >= self.pkt_len {
                         let item = src[..self.pkt_len].to_vec();
-                        // println!("PKT: {item:?}");
                         src.advance(self.pkt_len);
                         self.pkt_start = false;
                         self.pkt_len = 0;
@@ -88,16 +131,20 @@ mod framed_codec {
                         Ok(None)
                     }
                 }
-                false => match src.windows(4).position(|w| w == START_PATTERN) {
+                false => match src
+                    .windows(START_PATTERN.len())
+                    .position(|w| w == START_PATTERN)
+                {
                     // Look for START flag
                     Some(i) => {
+                        // println!("++ Found START: {i}");
                         // Advance to START
                         src.advance(i);
                         // Check if have full header
-                        if src.len() >= HEADER_LEN {
-                            self.pkt_len = u16::from_le_bytes([src[4], src[5]]) as usize;
+                        if src.len() >= FRAME_HEADER_LEN {
+                            self.pkt_len = src[FRAME_HEADER_LEN - 1] as usize;
                             // Advance past header and set pkt_start flag
-                            src.advance(HEADER_LEN);
+                            src.advance(FRAME_HEADER_LEN);
                             self.pkt_start = true;
                         }
                         Ok(None)
@@ -119,3 +166,4 @@ mod framed_codec {
         }
     }
 }
+*/
