@@ -57,67 +57,46 @@ async fn main() -> anyhow::Result<()> {
 
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
 
-    // USB task
-    tokio::spawn(async move {
-        let mut counter = 0_u32;
-        loop {
-            tokio::select! {
-                rx = framed.try_next() => {
-                    match rx {
-                        Ok(Some(Ok(pkt))) => {
-                            println!(">> RX Packet: {pkt:?} [{}]", String::from_utf8_lossy(&pkt));
-                            let reply = counter.to_le_bytes();
-                            match framed.send(&reply).await {
-                                Ok(_) => println!(">> Sent Reply: {reply:?}"),
-                                Err(e) => eprintln!(">> Error Sending Data: {e:?}"),
-                            }
-                        }
-                        Ok(Some(Err(e))) => eprintln!(">> RX Error: {e:?}"),
-                        Ok(None) => {}
-                        Err(e) => eprintln!("ERR: {e}"),
-                    }
-                    counter += 1;
-                }
-                msg = rx_queue.recv() => {
-                    if let Some(data) = msg {
-                        println!(">> TX from stdin: {:?}", String::from_utf8_lossy(&data));
-                        if let Err(e) = framed.send(&data).await {
-                            eprintln!(">> Error Sending stdin message: {e:?}");
-                        }
-                    } else {
-                        break; // stdin task dropped tx
-                    }
+    let mut counter = 0_u32;
 
+    loop {
+        tokio::select! {
+            rx = framed.try_next() => {
+                match rx {
+                    Ok(Some(Ok(pkt))) => {
+                        println!(">> RX Packet: {pkt:?} [{}]", String::from_utf8_lossy(&pkt));
+                        let reply = counter.to_le_bytes();
+                        match framed.send(&reply).await {
+                            Ok(_) => println!(">> Sent Reply: {reply:?}"),
+                            Err(e) => eprintln!(">> Error Sending Data: {e:?}"),
+                        }
+                    }
+                    Ok(Some(Err(e))) => eprintln!(">> RX Error: {e:?}"),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("ERR: {e}"),
                 }
-                _ = ticker.tick() => {
-                    println!("+++ TICK");
+                counter += 1;
+            }
+            msg = rx_queue.recv() => {
+                if let Some(data) = msg {
+                    println!(">> TX from stdin: {:?}", String::from_utf8_lossy(&data));
+                    if let Err(e) = framed.send(&data).await {
+                        eprintln!(">> Error Sending stdin message: {e:?}");
+                    }
+                } else {
+                    break; // stdin task dropped tx
                 }
+
+            }
+            _ = ticker.tick() => {
+                println!("+++ TICK");
+            }
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nReceived Ctrl-C! Shutting down...\n");
+                break;
             }
         }
-    });
-
-    /*
-    tokio::spawn(async move {
-        let mut counter = 0_u32;
-        loop {
-            match framed.try_next().await {
-                Ok(Some(Ok(pkt))) => {
-                    println!(">> RX Packet: {pkt:?} [{}]", String::from_utf8_lossy(&pkt));
-                    let reply = counter.to_le_bytes();
-                    match framed.send(&reply).await {
-                        Ok(_) => println!(">> Sent Reply: {reply:?}"),
-                        Err(e) => eprintln!(">> Error Sending Data: {e:?}"),
-                    }
-                }
-                Ok(Some(Err(e))) => eprintln!(">> RX Error: {e:?}"),
-                Ok(None) => {}
-                Err(e) => eprintln!("ERR: {e}"),
-            }
-            counter += 1;
-        }
-    });
-    */
-
-    tokio::signal::ctrl_c().await?;
+    }
+    println!("BYE");
     Ok(())
 }
