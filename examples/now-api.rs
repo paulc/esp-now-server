@@ -3,12 +3,27 @@ use std::env;
 use futures_util::sink::SinkExt;
 
 use tokio::sync::mpsc;
+// use tokio::time::{Duration, Timeout};
 use tokio_serial::SerialPortBuilderExt;
 use tokio_stream::StreamExt;
 use tokio_util::codec::Framed;
 
-use esp_now_server::framed_codec::FramedBinaryCodec;
-//use sensor_message::SensorMessage;
+use esp_now_protocol::format_mac::from_mac;
+use esp_now_protocol::{BroadcastData, Msg, TxData};
+use esp_now_server::framed_codec::{FramedBinaryCodec, MAX_PAYLOAD_LEN};
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static MSG_ID: AtomicU32 = AtomicU32::new(0);
+
+fn encode_msg(msg: &Msg) -> Result<heapless::Vec<u8, MAX_PAYLOAD_LEN>, ()> {
+    let src: heapless::Vec<u8, MAX_PAYLOAD_LEN> = msg.to_heapless().map_err(|_| ())?;
+    heapless::Vec::from_slice(&src).map_err(|_| ())
+}
+
+fn next_id() -> u32 {
+    MSG_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -64,27 +79,37 @@ async fn main() -> anyhow::Result<()> {
             rx = framed.try_next() => {
                 match rx {
                     Ok(Some(Ok(pkt))) => {
-                        println!(">> RX Packet: {pkt:?} [{}]", String::from_utf8_lossy(&pkt));
-                        let reply = counter.to_le_bytes();
-                        match framed.send(&reply).await {
-                            Ok(_) => println!(">> Sent Reply: {reply:?}"),
-                            Err(e) => eprintln!(">> Error Sending Data: {e:?}"),
+                        if let Ok(msg) = Msg::from_slice(&pkt) {
+                            println!("[+] RX Msg: {msg}")
+                        } else {
+                            eprintln!("[-] Invalid Msg {pkt:?}");
                         }
                     }
                     Ok(Some(Err(e))) => eprintln!(">> RX Error: {e:?}"),
                     Ok(None) => {}
                     Err(e) => {
-                        eprintln!("SERIAL ERR: {e}");
-                        break;
+                        eprintln!("ERR: {e}");
+                        break
                     }
                 }
                 counter += 1;
             }
             msg = rx_queue.recv() => {
-                if let Some(data) = msg {
-                    println!(">> TX from stdin: {:?}", String::from_utf8_lossy(&data));
-                    if let Err(e) = framed.send(&data).await {
-                        eprintln!(">> Error Sending stdin message: {e:?}");
+                if let Some(bcast) = msg {
+                    // println!(">> TX from stdin: {:?}", String::from_utf8_lossy(&bcast));
+                    // Send Broadcast
+                    let mut data = heapless::Vec::<u8, 250>::new();
+                    data.extend_from_slice(&bcast).unwrap();
+                    let msg = Msg::Broadcast(BroadcastData {
+                        id: next_id(),
+                        interval: Some(5),
+                        data,
+                    });
+                    if let Err(e) = framed.send(&encode_msg(&msg).unwrap()).await {
+                        eprintln!(">> Error Sending BROADCAST message: {e:?}");
+                    } else {
+                        println!("Sent BROADCAST Message: OK {msg}");
+                        println!("[+] BROADCAST Msg: {msg}")
                     }
                 } else {
                     break; // stdin task dropped tx
@@ -92,7 +117,20 @@ async fn main() -> anyhow::Result<()> {
 
             }
             _ = ticker.tick() => {
-                println!("+++ TICK");
+                // Send TX message
+                let mut data = heapless::Vec::<u8, 250>::new();
+                data.extend_from_slice("HELLO".as_bytes()).unwrap();
+                let msg = Msg::Send(TxData {
+                    id: next_id(),
+                    dst_addr: from_mac("98:a3:16:8e:ff:c0").unwrap(),
+                    data,
+                    defer: false,
+                });
+                if let Err(e) = framed.send(&encode_msg(&msg).unwrap()).await {
+                    eprintln!(">> Error Sending TX message: {e:?}");
+                } else {
+                    println!("[+] TX Msg: {msg}")
+                }
             }
             _ = tokio::signal::ctrl_c() => {
                 println!("\nReceived Ctrl-C! Shutting down...\n");

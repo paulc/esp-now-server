@@ -74,8 +74,8 @@ async fn main() -> anyhow::Result<()> {
                     Ok(Some(Err(e))) => eprintln!(">> RX Error: {e:?}"),
                     Ok(None) => {}
                     Err(e) => {
-                        eprintln!("SERIAL ERR: {e}");
-                        break;
+                        eprintln!("ERR: {e}");
+                        break
                     }
                 }
                 counter += 1;
