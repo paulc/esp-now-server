@@ -81,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
                     Ok(Some(Ok(pkt))) => {
                         if let Ok(msg) = Msg::from_slice(&pkt) {
                             println!("[+] RX Msg: {msg}")
+                            // XXX Send reply
                         } else {
                             eprintln!("[-] Invalid Msg {pkt:?}");
                         }
