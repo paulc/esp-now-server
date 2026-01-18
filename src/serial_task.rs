@@ -30,13 +30,15 @@ pub fn next_id() -> u32 {
 pub struct SerialTask {
     tty_path: String,
     baud_rate: u32,
+    timeout_secs: u64,
 }
 
 impl SerialTask {
-    pub fn new(tty_path: String, baud_rate: u32) -> Self {
+    pub fn new(tty_path: String, baud_rate: u32, timeout_secs: u64) -> Self {
         Self {
             tty_path,
             baud_rate,
+            timeout_secs,
         }
     }
     pub async fn start(
@@ -58,6 +60,7 @@ impl SerialTask {
             .expect("Unable to set serial port exclusive to false");
 
         let mut framed = Framed::new(serial, FramedBinaryCodec::new());
+        let timeout_secs = self.timeout_secs;
 
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -75,17 +78,21 @@ impl SerialTask {
                                         Msg::Ack(ack) => {
                                             // Return ACK status
                                             if let Some(tx) = waiting_ack.remove(&ack.rx_id) {
-                                                info!(">>> GOT ACK: {}", ack.rx_id);
-                                                let _ = tx.send(true);
+                                                match tx.send(true) {
+                                                    Ok(_) => info!(">> ACK OK: {}", ack.rx_id),
+                                                    Err(_) => error!(">> ACK Timeout: {}", ack.rx_id),
+                                                }
                                             } else {
                                                 info!(">>> ACK NOT FOUND: {}", ack.rx_id);
                                             }
                                         },
                                         _ => {
                                             // Send to event queue
-                                            let msg_id = msg.get_id();
-                                            let status = event_tx.send(msg).is_ok();
-                                            // Send ack
+                                            let _msg_id = msg.get_id();
+                                            let _status = event_tx.send(msg).is_ok();
+
+                                            /*
+                                            // Dont Send ACK for events
                                             let ack = Msg::Ack (
                                                 Ack { id: next_id(), rx_id: msg_id, status }
                                             );
@@ -98,6 +105,7 @@ impl SerialTask {
                                                     error!("[-] Ack Error: {e}");
                                                 }
                                             }
+                                            */
                                         }
                                     }
                                 } else {
@@ -117,7 +125,7 @@ impl SerialTask {
                         match command {
                             Some(msg) => {
                                 info!("[+] RX COMMAND: {msg}");
-                                match send_msg(&mut framed, msg).await {
+                                match send_msg(&mut framed, msg, timeout_secs).await {
                                     Ok((id,tx)) => {
                                         // Save channel in ack hashmap
                                         waiting_ack.insert(id,tx);
@@ -156,6 +164,7 @@ impl SerialTask {
 async fn send_msg(
     framed: &mut Framed<SerialStream, FramedBinaryCodec>,
     msg: Msg,
+    timeout_secs: u64,
 ) -> Result<(u32, oneshot::Sender<bool>), Box<dyn std::error::Error>> {
     let id = msg.get_id();
     let encoded_msg = encode_msg(&msg).expect("Error encoding msg: {msg}");
@@ -165,8 +174,8 @@ async fn send_msg(
     // Spawn a task to wait for the ACK (with timeout)
     let (tx, rx) = oneshot::channel::<bool>();
     tokio::spawn(async move {
-        // Wait max 1 second for a ACK
-        match timeout(Duration::from_secs(1), rx).await {
+        // Wait for ACK
+        match timeout(Duration::from_secs(timeout_secs), rx).await {
             Ok(Ok(status)) => {
                 // RX ACK
                 debug!("[+] RX Ack: {msg} -> {status}");
