@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{timeout, Duration};
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use tokio_stream::StreamExt;
@@ -12,7 +12,7 @@ use futures_util::sink::SinkExt;
 #[allow(unused_imports)]
 use tracing::{debug, error, info, warn};
 
-use esp_now_protocol::{Ack, Msg};
+use esp_now_protocol::{Monitor, Msg};
 
 use crate::framed_codec::{FramedBinaryCodec, MAX_PAYLOAD_LEN};
 
@@ -28,9 +28,9 @@ pub fn next_id() -> u32 {
 }
 
 pub struct SerialTask {
-    tty_path: String,
-    baud_rate: u32,
-    timeout_secs: u64,
+    pub tty_path: String,
+    pub baud_rate: u32,
+    pub timeout_secs: u64,
 }
 
 impl SerialTask {
@@ -44,20 +44,24 @@ impl SerialTask {
     pub async fn start(
         &self,
     ) -> Result<
-        (mpsc::UnboundedSender<Msg>, mpsc::UnboundedReceiver<Msg>),
+        (
+            mpsc::UnboundedSender<Msg>,
+            mpsc::UnboundedReceiver<Msg>,
+            watch::Receiver<Option<Monitor>>,
+        ),
+        // We return a watch channel for monitoring in addition to the mpsc channels
         Box<dyn std::error::Error>,
     > {
         // Create channels
         let (command_tx, mut command_rx) = mpsc::unbounded_channel::<Msg>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<Msg>();
+        let (monitor_tx, monitor_rx) = watch::channel::<Option<Monitor>>(None);
 
         let mut serial =
             tokio_serial::new(self.tty_path.clone(), self.baud_rate).open_native_async()?;
 
         #[cfg(unix)]
-        serial
-            .set_exclusive(false)
-            .expect("Unable to set serial port exclusive to false");
+        serial.set_exclusive(false)?;
 
         let mut framed = Framed::new(serial, FramedBinaryCodec::new());
         let timeout_secs = self.timeout_secs;
@@ -69,21 +73,25 @@ impl SerialTask {
             loop {
                 tokio::select! {
                     serial_rx = framed.try_next() => {
-                        info!("SELECT --> FRAMED");
+                        debug!("SELECT --> FRAMED");
                         match serial_rx {
                             Ok(Some(Ok(pkt))) => {
                                 if let Ok(msg) = Msg::from_slice(&pkt) {
-                                    info!("[+] RX Msg: {msg}");
+
+                                    info!("SERIAL RX ->> {msg}");
+                                    // Send monitor message to channel
+                                    let _ = monitor_tx.send(Some(Monitor::new_rx(&msg)));
+
                                     match msg {
                                         Msg::Ack(ack) => {
                                             // Return ACK status
                                             if let Some(tx) = waiting_ack.remove(&ack.rx_id) {
                                                 match tx.send(true) {
-                                                    Ok(_) => info!(">> ACK OK: {}", ack.rx_id),
-                                                    Err(_) => error!(">> ACK Timeout: {}", ack.rx_id),
+                                                    Ok(_) => info!("  -> ACK OK: {} <{}>", ack.rx_id, if ack.status { "SUCCESS" } else { "ERROR" }),
+                                                    Err(_) => error!("  -> ACK Timeout: {}", ack.rx_id),
                                                 }
                                             } else {
-                                                info!(">>> ACK NOT FOUND: {}", ack.rx_id);
+                                                error!("  -> ACK Id Not Found: {}", ack.rx_id);
                                             }
                                         },
                                         _ => {
@@ -92,7 +100,7 @@ impl SerialTask {
                                             let _status = event_tx.send(msg).is_ok();
 
                                             /*
-                                            // Dont Send ACK for events
+                                            // Dont Send ACK for esp -> server events
                                             let ack = Msg::Ack (
                                                 Ack { id: next_id(), rx_id: msg_id, status }
                                             );
@@ -109,45 +117,55 @@ impl SerialTask {
                                         }
                                     }
                                 } else {
-                                    error!("[-] Invalid Msg {pkt:?}");
+                                    error!("SERIAL RX ->> Invalid Msg {pkt:?}");
+                                    // Send monitor message to channel
+                                    let _ = monitor_tx.send(Some(Monitor::RxError));
                                 }
                             }
-                            Ok(Some(Err(e))) => error!(">> RX Error: {e:?}"),
+                            Ok(Some(Err(e))) => error!("SERIAL RX ->> RX Error: {e:?}"),
                             Ok(None) => {}
                             Err(e) => {
-                                error!("ERR: {e}");
+                                error!("SERIAL RX ->> Device Error: {e}");
                                 break
                             }
                         }
                     }
                     command = command_rx.recv() => {
-                        info!("SELECT --> COMMAND");
+                        debug!("SELECT --> COMMAND");
                         match command {
                             Some(msg) => {
-                                info!("[+] RX COMMAND: {msg}");
-                                match send_msg(&mut framed, msg, timeout_secs).await {
+                                info!("COMMAND RX ->> {msg}");
+                                match send_msg(&mut framed, msg.clone(), timeout_secs).await {
                                     Ok((id,tx)) => {
                                         // Save channel in ack hashmap
                                         waiting_ack.insert(id,tx);
+                                        info!("SERIAL TX ->> {msg}");
+                                        // Send monitor message to channel
+                                        let _ = monitor_tx.send(Some(Monitor::new_tx(&msg)));
                                     },
-                                    Err(e) => error!("[-] TX Error: {e}")
+                                    Err(e) => {
+                                        error!("SERIAL TX ->> Error: {e}");
+                                        // Send monitor message to channel
+                                        let _ = monitor_tx.send(Some(Monitor::new_txerror()));
+                                    }
                                 }
                             }
                             None=> {
                                 // Channel closed
+                                error!("COMMAND RX ->> Channel Closed");
                                 break;
                             }
                         }
                     }
                     _ = ticker.tick() => {
-                        info!("SELECT --> TICK");
+                        debug!("SELECT --> TICK");
                         // Prune waiting_ack
                         let keys: Vec<u32> = waiting_ack.keys().copied().collect();
+                            info!("TICK ->> Pruning Ack Map: {}", keys.len());
                         keys.into_iter().for_each(|k| {
                             let v = waiting_ack.remove(&k).unwrap(); // Safe
-                            info!("WAITING_ACK: >> {k} : {v:?}");
                             if v.is_closed() {
-                                info!("[-] Pruning expired ack: id={k}");
+                                info!("  >> Pruning expired ack: id={k}");
                             } else {
                                 waiting_ack.insert(k, v);
                             }
@@ -157,8 +175,12 @@ impl SerialTask {
             }
         });
 
-        Ok((command_tx, event_rx))
+        Ok((command_tx, event_rx, monitor_rx))
     }
+}
+
+fn strerror<'a>(e: &'a str) -> Box<dyn std::error::Error> {
+    e.to_string().into()
 }
 
 async fn send_msg(
@@ -167,9 +189,8 @@ async fn send_msg(
     timeout_secs: u64,
 ) -> Result<(u32, oneshot::Sender<bool>), Box<dyn std::error::Error>> {
     let id = msg.get_id();
-    let encoded_msg = encode_msg(&msg).expect("Error encoding msg: {msg}");
+    let encoded_msg = encode_msg(&msg).map_err(|_| strerror("Msg Encoding Error"))?;
     framed.send(&encoded_msg).await?;
-    debug!("[+] TX Msg OK: {msg}");
 
     // Spawn a task to wait for the ACK (with timeout)
     let (tx, rx) = oneshot::channel::<bool>();
@@ -178,15 +199,15 @@ async fn send_msg(
         match timeout(Duration::from_secs(timeout_secs), rx).await {
             Ok(Ok(status)) => {
                 // RX ACK
-                debug!("[+] RX Ack: {msg} -> {status}");
+                debug!("ACK ->> {id} : {status} [{msg}]");
             }
             Ok(Err(_)) => {
                 // Channel closed: The sender was dropped without sending
-                error!("[-] RX channel closed: {}", id);
+                debug!("ACK ->> RX channel closed: {} [{msg}]", id);
             }
             Err(_) => {
                 // Timeout
-                error!("[-] Timeout: {msg}");
+                debug!("ACK ->> Timeout: {id} [{msg}]");
             }
         }
     });
