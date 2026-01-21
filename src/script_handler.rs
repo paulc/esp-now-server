@@ -1,32 +1,40 @@
-use rhai::{Engine, EvalAltResult, ParseError, AST};
+use esp_now_protocol::Msg;
+use rhai::{Dynamic, Engine, EvalAltResult, Scope, AST};
 
 pub struct ScriptHandler {
     engine: Engine,
-    init_handler: Option<AST>,
-    timer_handler: Option<AST>,
-    rx_handler: Option<AST>,
+    ast: AST,
 }
 
 impl ScriptHandler {
-    pub fn new(
-        init_script: Option<String>,
-        timer_script: Option<String>,
-        rx_script: Option<String>,
-    ) -> Result<Self, ParseError> {
-        let engine = Engine::new();
-        let init_handler = init_script.map(|s| engine.compile(s)).transpose()?;
-        let timer_handler = timer_script.map(|s| engine.compile(s)).transpose()?;
-        let rx_handler = rx_script.map(|s| engine.compile(s)).transpose()?;
-        Ok(Self {
-            engine,
-            init_handler,
-            timer_handler,
-            rx_handler,
-        })
+    pub fn new(script: String) -> Result<Self, Box<EvalAltResult>> {
+        let mut engine = Engine::new();
+        engine.register_fn("parse", parse_msg);
+        let ast = if script.starts_with("@") {
+            engine.compile_file(script[1..].into())?
+        } else {
+            engine.compile(script)?
+        };
+        Ok(Self { engine, ast })
     }
-    pub fn call_init(&self) -> Result<(), Box<EvalAltResult>> {
-        self.init_handler
-            .as_ref()
-            .map_or_else(|| Ok(()), |ast| self.engine.run_ast(ast))
+    pub fn on_init(&self, msg: Dynamic) -> Result<(), Box<EvalAltResult>> {
+        if self.ast.iter_functions().any(|m| m.name == "on_init") {
+            let mut scope = Scope::new();
+            self.engine
+                .call_fn::<()>(&mut scope, &self.ast, "on_init", (msg,))?;
+        }
+        Ok(())
     }
+    pub fn on_event(&self, msg: Dynamic) -> Result<(), Box<EvalAltResult>> {
+        if self.ast.iter_functions().any(|m| m.name == "on_event") {
+            let mut scope = Scope::new();
+            self.engine
+                .call_fn::<()>(&mut scope, &self.ast, "on_event", (msg,))?;
+        }
+        Ok(())
+    }
+}
+
+fn parse_msg(m: &mut Msg) -> Result<Dynamic, Box<EvalAltResult>> {
+    rhai::serde::to_dynamic(m)
 }

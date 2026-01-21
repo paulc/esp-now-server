@@ -1,4 +1,6 @@
-use esp_now_protocol::{format_mac::from_mac, BroadcastData, Msg, TxData, MAX_DATA_LEN};
+use esp_now_protocol::{
+    format_mac::from_mac, BroadcastData, InitConfig, Msg, TxData, MAX_DATA_LEN,
+};
 
 use esp_now_server::script_handler::ScriptHandler;
 use esp_now_server::serial_task::{next_id, SerialTask};
@@ -9,6 +11,36 @@ use tokio_stream::wrappers::WatchStream;
 use tokio_stream::StreamExt;
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use rhai::Dynamic;
+
+use argh::FromArgs;
+
+#[derive(FromArgs)]
+/// ESP-NOW Bridge
+struct CliArgs {
+    #[argh(option, short = 't')]
+    /// TTY path
+    tty: String,
+    #[argh(option, short = 's')]
+    /// RHAI handler script [@filename to read from file]
+    script: String,
+    #[argh(option, default = "default_baud()")]
+    /// baud rate (default: 115200)
+    baud: u32,
+    #[argh(option, default = "default_timeout()")]
+    /// ack timeout (default 2s)
+    ack_timeout: u64,
+}
+
+fn default_baud() -> u32 {
+    115200
+}
+
+fn default_timeout() -> u64 {
+    2
+}
 
 static USER_EXIT: AtomicBool = AtomicBool::new(false);
 
@@ -22,6 +54,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_line_number(true)
         .init();
 
+    // Get CLI Args
+    let args: CliArgs = argh::from_env();
+
     // Start task waiting for Ctrl-C
     tokio::spawn(async move {
         ctrl_c().await.expect("Error listening for Ctrl-C");
@@ -29,10 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Start Serial task
-    let serial = SerialTask::new("/dev/tty.usbmodem3101".into(), 115200, 6);
+    let serial = SerialTask::new(args.tty, args.baud, 6);
 
     // Create Script Handler
-    let handler = ScriptHandler::new(Some(r#"print(">>> INIT <<<")"#.into()), None, None)?;
+    let script = Arc::new(ScriptHandler::new(args.script)?);
 
     loop {
         match serial.start().await {
@@ -43,9 +78,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 sleep(Duration::from_secs(1)).await;
             }
+
             Ok((command_tx, mut event_rx, monitor_rx)) => {
                 info!("SERIAL ->> Connected to serial port: {}", serial.tty_path);
-                info!(">> INIT: {:?}", handler.call_init());
+
+                // XXX
+                let msg = Msg::Init(InitConfig {
+                    id: 99,
+                    api_version: 1,
+                    now_version: 2,
+                    channel: 11,
+                    address: from_mac("00:11:22:33:44:55").unwrap(),
+                });
+
+                let status = script.on_init(Dynamic::from(msg));
+                info!(">>> ON_INIT: {status:?}");
 
                 // Spawn monitor task
                 let monitor_handle = tokio::spawn(async move {
@@ -58,10 +105,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 });
+
                 // Spawn a task to handle events
+                let script_clone = Arc::clone(&script);
                 let event_handle = tokio::spawn(async move {
                     while let Some(msg) = event_rx.recv().await {
                         info!("RECEIVED EVENT ->> {msg}");
+                        let _ = script_clone.on_event(Dynamic::from(msg));
                     }
                 });
 
