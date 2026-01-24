@@ -1,9 +1,5 @@
-use esp_now_protocol::{
-    format_mac::from_mac, BroadcastData, InitConfig, Msg, TxData, MAX_DATA_LEN,
-};
-
 use esp_now_server::hook::Hook;
-use esp_now_server::serial_task::{next_id, SerialTask};
+use esp_now_server::serial_task::SerialTask;
 
 use tokio::signal::ctrl_c;
 use tokio::time::{sleep, Duration};
@@ -87,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Call init method
                 match hook.on_init() {
-                    Ok(v) => info!("ON_INIT: {v:?}"),
+                    Ok(v) => debug!("ON_INIT: {v:?}"),
                     Err(e) => error!("ON_INIT: {e:?}"),
                 }
 
@@ -97,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     while let Some(msg) = event_rx.recv().await {
                         info!("RECEIVED EVENT ->> {msg}");
                         match hook_clone.on_event(Dynamic::from(msg)) {
-                            Ok(v) => info!("ON_EVENT: {v:?}"),
+                            Ok(v) => debug!("ON_EVENT: {v:?}"),
                             Err(e) => error!("ON_EVENT: {e:?}"),
                         }
                     }
@@ -110,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         loop {
                             sleep(Duration::from_secs(t)).await;
                             match hook_clone.on_tick(INT::from(counter as i64)) {
-                                Ok(v) => info!("ON_TICK: {v:?}"),
+                                Ok(v) => debug!("ON_TICK: {v:?}"),
                                 Err(e) => error!("ON_TICK: {e:?}"),
                             }
                             counter += 1;

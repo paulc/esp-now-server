@@ -1,5 +1,8 @@
+use crate::mqtt_task::MqttCommand;
 use crate::serial_task::next_id;
+
 use esp_now_protocol::{BroadcastData, Msg, TxData, MAX_DATA_LEN};
+
 use rhai::{Array, Blob, Dynamic, Engine, EvalAltResult, ImmutableString, Scope, AST, INT};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -19,6 +22,7 @@ impl Hook {
         let mut engine = Engine::new();
         engine.register_fn("parse", parse_msg);
         engine.register_fn("to_msg", to_msg);
+        engine.register_fn("to_blob", to_blob);
         engine.register_fn("format_mac", format_mac);
         engine.register_fn("from_mac", from_mac);
         engine.register_fn("next_id", next_id);
@@ -30,8 +34,8 @@ impl Hook {
             "command_tx",
             move |msg: &mut Msg| -> Result<(), Box<EvalAltResult>> {
                 match command_tx.send(msg.clone()) {
-                    Ok(_) => println!("=== Msg Sent OK"),
-                    Err(e) => eprintln!("=== Error sending Msg: {e:?}"),
+                    Ok(_) => debug!("[HOOK] Msg Sent OK"),
+                    Err(e) => error!("[HOOK]  Error sending Msg: {e:?}"),
                 }
                 Ok(())
             },
@@ -70,6 +74,54 @@ impl Hook {
     }
 }
 
+pub struct MqttHook {
+    engine: Engine,
+    ast: AST,
+}
+
+impl MqttHook {
+    pub fn new(
+        script: String,
+        command_tx: UnboundedSender<MqttCommand>,
+    ) -> Result<Self, Box<EvalAltResult>> {
+        let mut engine = Engine::new();
+        // Move command_tx into fn
+        engine.register_fn(
+            "mqtt_cmd",
+            move |cmd: &mut MqttCommand| -> Result<(), Box<EvalAltResult>> {
+                match command_tx.send(cmd.clone()) {
+                    Ok(_) => debug!("[HOOK] MQTT Command Sent OK"),
+                    Err(e) => error!("[HOOK]  Error sending MQTT Command: {e:?}"),
+                }
+                Ok(())
+            },
+        );
+        let ast = if script.starts_with("@") {
+            engine.compile_file(script[1..].into())?
+        } else {
+            engine.compile(script)?
+        };
+        Ok(Self { engine, ast })
+    }
+    pub fn on_init(&self) -> Result<Dynamic, Box<EvalAltResult>> {
+        if self.ast.iter_functions().any(|m| m.name == "on_init") {
+            let mut scope = Scope::new();
+            self.engine
+                .call_fn::<Dynamic>(&mut scope, &self.ast, "on_init", ())
+        } else {
+            Ok(().into())
+        }
+    }
+    pub fn on_tick(&self, counter: INT) -> Result<(), Box<EvalAltResult>> {
+        if self.ast.iter_functions().any(|m| m.name == "on_tick") {
+            let mut scope = Scope::new();
+            self.engine
+                .call_fn::<()>(&mut scope, &self.ast, "on_tick", (counter,))?;
+        }
+        Ok(())
+    }
+}
+
 // Msg from Object-Map
 fn to_msg(m: &mut rhai::Dynamic) -> Result<Msg, Box<EvalAltResult>> {
     rhai::serde::from_dynamic(m)
@@ -78,6 +130,16 @@ fn to_msg(m: &mut rhai::Dynamic) -> Result<Msg, Box<EvalAltResult>> {
 // Object-Map from Msg
 fn parse_msg(m: &mut Msg) -> Result<Dynamic, Box<EvalAltResult>> {
     rhai::serde::to_dynamic(m)
+}
+
+fn to_blob(arr: &mut Array) -> Result<Blob, Box<EvalAltResult>> {
+    arr.iter()
+        .map(|b| {
+            b.as_int()
+                .and_then(|i| u8::try_from(i).map_err(|_| "Invalid Byte"))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| runtime_error(e))
 }
 
 fn format_mac(mac: &mut Array) -> Result<ImmutableString, Box<EvalAltResult>> {

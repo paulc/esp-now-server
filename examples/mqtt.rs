@@ -1,25 +1,79 @@
+use std::sync::Arc;
+
+use esp_now_server::hook::MqttHook;
 use esp_now_server::mqtt_task::{MqttCommand, MqttConfig, MqttEvent, MqttTask, QoS};
+
 use tokio::time::Duration;
+
+use argh::FromArgs;
 
 #[allow(unused_imports)]
 use tracing::{debug, error, info, warn};
+
+#[derive(FromArgs)]
+/// MQTT Test
+struct CliArgs {
+    #[argh(option)]
+    /// RHAI script
+    script: String,
+    #[argh(option, default = "default_addr()")]
+    /// mqtt broker address (default: 127.0.0.1)
+    address: String,
+    #[argh(option, default = "default_port()")]
+    /// mqtt broker port (default: 1883)
+    port: u16,
+    #[argh(option)]
+    /// tick event interval
+    _tick: Option<u64>,
+    #[argh(option)]
+    /// mqtt username
+    username: Option<String>,
+    #[argh(option)]
+    /// mqtt password
+    password: Option<String>,
+    #[argh(option)]
+    /// mqtt client-id
+    client_id: Option<String>,
+}
+
+fn default_addr() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_port() -> u16 {
+    1883
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    // Create MQTT configuration for testing with our local server
+    // Get CLI Args
+    let args: CliArgs = argh::from_env();
+
+    // Create MQTT configuration
     let config = MqttConfig {
-        broker_addr: "127.0.0.1".to_string(),
-        broker_port: 1883,
-        client_id: "test_client".to_string(),
-        username: Some("admin".to_string()),
-        password: Some("admin123".to_string()),
+        broker_addr: args.address,
+        broker_port: args.port,
+        client_id: args
+            .client_id
+            .unwrap_or(format!("mqtt_client_{}", uuid::Uuid::new_v4())),
+        username: args.username,
+        password: args.password,
         ..Default::default()
     };
 
     // Start the MQTT task
     let (command_tx, mut event_rx) = MqttTask::new(config).start().await?;
+
+    // Create Hook Handler
+    let hook = Arc::new(MqttHook::new(args.script.clone(), command_tx.clone())?);
+
+    // Call init method
+    match hook.on_init() {
+        Ok(v) => info!("ON_INIT: {v:?}"),
+        Err(e) => error!("ON_INIT: {e:?}"),
+    }
 
     let command_tx_task = command_tx.clone();
 
