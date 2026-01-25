@@ -13,6 +13,18 @@ pub enum QoS {
     ExactlyOnce,
 }
 
+impl TryFrom<&str> for QoS {
+    type Error = ();
+    fn try_from(s: &str) -> Result<Self, ()> {
+        match s.to_lowercase().as_str() {
+            "qos0" | "atmostonce" => Ok(QoS::AtMostOnce),
+            "qos1" | "atleastonce" => Ok(QoS::AtLeastOnce),
+            "qos2" | "exactlyonce" => Ok(QoS::ExactlyOnce),
+            _ => Err(()),
+        }
+    }
+}
+
 // Convert into rumqqtc::QoS
 impl From<QoS> for rumqttc::QoS {
     fn from(qos: QoS) -> Self {

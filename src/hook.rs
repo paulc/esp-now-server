@@ -1,4 +1,3 @@
-use crate::mqtt_task::MqttCommand;
 use crate::serial_task::next_id;
 
 use esp_now_protocol::{BroadcastData, Msg, TxData, MAX_DATA_LEN};
@@ -63,54 +62,6 @@ impl Hook {
                 .call_fn::<()>(&mut scope, &self.ast, "on_event", (msg,))?;
         }
         Ok(())
-    }
-    pub fn on_tick(&self, counter: INT) -> Result<(), Box<EvalAltResult>> {
-        if self.ast.iter_functions().any(|m| m.name == "on_tick") {
-            let mut scope = Scope::new();
-            self.engine
-                .call_fn::<()>(&mut scope, &self.ast, "on_tick", (counter,))?;
-        }
-        Ok(())
-    }
-}
-
-pub struct MqttHook {
-    engine: Engine,
-    ast: AST,
-}
-
-impl MqttHook {
-    pub fn new(
-        script: String,
-        command_tx: UnboundedSender<MqttCommand>,
-    ) -> Result<Self, Box<EvalAltResult>> {
-        let mut engine = Engine::new();
-        // Move command_tx into fn
-        engine.register_fn(
-            "mqtt_cmd",
-            move |cmd: &mut MqttCommand| -> Result<(), Box<EvalAltResult>> {
-                match command_tx.send(cmd.clone()) {
-                    Ok(_) => debug!("[HOOK] MQTT Command Sent OK"),
-                    Err(e) => error!("[HOOK]  Error sending MQTT Command: {e:?}"),
-                }
-                Ok(())
-            },
-        );
-        let ast = if script.starts_with("@") {
-            engine.compile_file(script[1..].into())?
-        } else {
-            engine.compile(script)?
-        };
-        Ok(Self { engine, ast })
-    }
-    pub fn on_init(&self) -> Result<Dynamic, Box<EvalAltResult>> {
-        if self.ast.iter_functions().any(|m| m.name == "on_init") {
-            let mut scope = Scope::new();
-            self.engine
-                .call_fn::<Dynamic>(&mut scope, &self.ast, "on_init", ())
-        } else {
-            Ok(().into())
-        }
     }
     pub fn on_tick(&self, counter: INT) -> Result<(), Box<EvalAltResult>> {
         if self.ast.iter_functions().any(|m| m.name == "on_tick") {
