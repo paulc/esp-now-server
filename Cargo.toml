@@ -23,3 +23,9 @@ tracing-subscriber = "0.3.22"
 rhai = { version = "1.24.0", features = ["serde", "sync"] }
 argh = "0.1.13"
 url = "2.5.8"
+rquickjs = { optional = true, version = "0.11.0", features = ["futures", "macro", "loader", "dyn-load", "rust-alloc"] }
+rustyline = "17.0.2"
+
+[features]
+default = ["js"]
+js = ["rquickjs"]
