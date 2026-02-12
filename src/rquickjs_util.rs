@@ -55,12 +55,13 @@ pub fn register_tx_channel<'js, T>(
     f: &str,
 ) -> anyhow::Result<()>
 where
-    T: rquickjs::IntoJs<'js> + rquickjs::FromJs<'js> + Clone + Send + 'static,
+    T: rquickjs::IntoJs<'js> + rquickjs::FromJs<'js> + Clone + Send + std::fmt::Debug + 'static,
 {
     let tx = Arc::new(Mutex::new(tx));
     ctx.globals().set(
         f,
         Func::new(Async(move |ctx, msg: T| {
+            println!("TX >> {:?}", msg);
             let tx = tx.clone();
             async move {
                 match tx
@@ -87,7 +88,7 @@ pub fn register_rx_channel<'js, T>(
     f: &str,
 ) -> anyhow::Result<()>
 where
-    T: rquickjs::IntoJs<'js> + rquickjs::FromJs<'js> + Clone + Send + 'static,
+    T: rquickjs::IntoJs<'js> + rquickjs::FromJs<'js> + Clone + Send + std::fmt::Debug + 'static,
 {
     let rx = Arc::new(Mutex::new(rx));
     ctx.globals().set(
@@ -103,6 +104,7 @@ where
                         .recv()
                         .await
                 } {
+                    println!("TX >> {:?}", msg);
                     Ok::<T, rquickjs::Error>(msg)
                 } else {
                     Err::<T, rquickjs::Error>(Exception::throw_message(&ctx, "RX Channel Closed"))
@@ -238,8 +240,8 @@ async fn sleep(n: u64) -> rquickjs::Result<()> {
 #[rquickjs::function]
 async fn set_timeout<'js>(
     ctx: Ctx<'js>,
-    n: u64,
     f: Function<'js>,
+    n: u64,
     args: Rest<Value<'js>>,
 ) -> rquickjs::Result<()> {
     tokio::time::sleep(Duration::from_secs(n)).await;

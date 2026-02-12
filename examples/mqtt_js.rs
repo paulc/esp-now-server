@@ -1,12 +1,17 @@
-use argh::FromArgs;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use esp_now_server::mqtt_task::register_mqtt;
+use esp_now_server::mqtt_task::{MqttConfig, MqttTask};
+use esp_now_server::mqtt_types::register_mqtt;
 use esp_now_server::rquickjs_util::{
-    call_fn, get_script, json_to_value, register_fns, register_oneshot, repl_rustyline, run_module,
-    run_script, value_to_json,
+    call_fn, get_script, json_to_value, register_fns, register_rx_channel, register_tx_channel,
+    repl_rustyline, run_module, run_script, value_to_json,
 };
 
+use argh::FromArgs;
+
 use rquickjs::{async_with, AsyncContext, AsyncRuntime};
+
+use tokio::signal::ctrl_c;
 
 #[derive(FromArgs)]
 /// CLI Args
@@ -26,11 +31,41 @@ struct CliArgs {
     #[argh(option)]
     /// call args
     arg: Vec<String>,
+    #[argh(option, default = "default_addr()")]
+    /// mqtt broker address (default: 127.0.0.1)
+    address: String,
+    #[argh(option, default = "default_port()")]
+    /// mqtt broker port (default: 1883)
+    port: u16,
+    #[argh(option)]
+    /// tick event interval
+    _tick: Option<u64>,
+    #[argh(option)]
+    /// mqtt username
+    username: Option<String>,
+    #[argh(option)]
+    /// mqtt password
+    password: Option<String>,
+    #[argh(option)]
+    /// mqtt client-id
+    client_id: Option<String>,
 }
 
-/// Basic CLI test
+fn default_addr() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_port() -> u16 {
+    1883
+}
+
+static USER_EXIT: AtomicBool = AtomicBool::new(false);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+
+    // Get CLI args
     let args: CliArgs = argh::from_env();
 
     // Check that we have something to do
@@ -39,24 +74,44 @@ async fn main() -> anyhow::Result<()> {
         CliArgs::from_args(&[&name], &["--help"]).map_err(|exit| anyhow::anyhow!(exit.output))?;
     }
 
+    // Create MQTT configuration
+    let config = MqttConfig {
+        broker_addr: args.address,
+        broker_port: args.port,
+        client_id: args
+            .client_id
+            .unwrap_or(format!("mqtt_client_{}", uuid::Uuid::new_v4())),
+        username: args.username,
+        password: args.password,
+        ..Default::default()
+    };
+
+    // Start task waiting for Ctrl-C
+    tokio::spawn(async move {
+        ctrl_c().await.expect("Error listening for Ctrl-C");
+        USER_EXIT.store(true, Ordering::Relaxed);
+    });
+
+    // Start the MQTT task
+    let (command_tx, event_rx) = MqttTask::new(config)
+        .start()
+        .await
+        .map_err(|e| anyhow::anyhow!("MqttTask: {e}"))?;
+
     let rt = AsyncRuntime::new()?;
     let ctx = AsyncContext::full(&rt).await?;
 
-    let (oneshot_tx, oneshot_rx) = tokio::sync::oneshot::channel::<String>();
+    command_tx.send(esp_now_server::mqtt_types::MqttCommand::Subscribe {
+        topic: "t1".into(),
+        qos: "qos0".try_into().unwrap(),
+    })?;
 
-    tokio::spawn(async move {
-        match oneshot_rx.await {
-            Ok(msg) => {
-                println!("[+] Oneshot Resolved -> {msg}");
-            }
-            Err(_) => eprintln!("[-] Oneshot Channel Closed"),
-        }
-    });
-
+    // Create
     async_with!(ctx => |ctx| {
         register_fns(&ctx)?;
         register_mqtt(&ctx)?;
-        register_oneshot(ctx.clone(), oneshot_tx, "resolve")?;
+        register_tx_channel(ctx.clone(), command_tx, "mqtt_tx")?;
+        register_rx_channel(ctx.clone(), event_rx, "mqtt_rx")?;
 
         // Run modules
         for module in args.module {
