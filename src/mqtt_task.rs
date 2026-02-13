@@ -122,7 +122,6 @@ async fn run_connection(
         tokio::select! {
             // Handle incoming commands
             command = local_command_rx.recv() => {
-                info!("RX COMMAND: {:?}", command);
                 match command {
                     Some(MqttCommand::Publish { topic, payload, qos }) => {
                         if connected {
@@ -178,7 +177,6 @@ async fn run_connection(
                                 let _ = event_tx.send(MqttEvent::Connected);
                             }
                             rumqttc::Packet::Publish(publish) => {
-                                info!("RX MQTT EVENT: {:?}", publish);
                                 let _ = event_tx.send(MqttEvent::MessageReceived {
                                     topic: publish.topic,
                                     payload: publish.payload.to_vec(),

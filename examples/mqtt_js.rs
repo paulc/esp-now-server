@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use esp_now_server::mqtt_task::{MqttConfig, MqttTask};
 use esp_now_server::mqtt_types::register_mqtt;
 use esp_now_server::rquickjs_util::{
-    call_fn, get_script, json_to_value, register_fns, register_rx_channel, register_tx_channel,
-    repl_rustyline, run_module, run_script, value_to_json,
+    call_fn, get_script, json_to_value, register_fns, register_rx_channel_cb, register_tx_channel,
+    repl_rl, run_module, run_script, value_to_json,
 };
 
 use argh::FromArgs;
@@ -89,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
     // Start task waiting for Ctrl-C
     tokio::spawn(async move {
         ctrl_c().await.expect("Error listening for Ctrl-C");
+        println!("[+] User Exit",);
         USER_EXIT.store(true, Ordering::Relaxed);
     });
 
@@ -101,6 +102,10 @@ async fn main() -> anyhow::Result<()> {
     let rt = AsyncRuntime::new()?;
     let ctx = AsyncContext::full(&rt).await?;
 
+    // Set interrupt handler (XXX this doesnt actually interrupt script eval)
+    rt.set_interrupt_handler(Some(Box::new(|| USER_EXIT.load(Ordering::Relaxed))))
+        .await;
+
     command_tx.send(esp_now_server::mqtt_types::MqttCommand::Subscribe {
         topic: "t1".into(),
         qos: "qos0".try_into().unwrap(),
@@ -111,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
         register_fns(&ctx)?;
         register_mqtt(&ctx)?;
         register_tx_channel(ctx.clone(), command_tx, "mqtt_tx")?;
-        register_rx_channel(ctx.clone(), event_rx, "mqtt_rx")?;
+        register_rx_channel_cb(ctx.clone(), event_rx, "mqtt_rx_cb")?;
 
         // Run modules
         for module in args.module {
@@ -125,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
 
         // Run REPL
         if args.repl {
-            repl_rustyline(ctx.clone()).await?;
+            repl_rl(ctx.clone()).await?;
         }
 
         // Call JS
@@ -137,13 +142,22 @@ async fn main() -> anyhow::Result<()> {
             };
             println!("[+] Call: {f}({a}) => {}", value_to_json(ctx.clone(),r)?);
         }
+
         Ok::<(),anyhow::Error>(())
     })
     .await?;
 
     println!("[+] Tasks Pending: {:?}", rt.is_job_pending().await);
 
-    rt.idle().await;
+    // Complete pending tasks - use rt.execute_pending_job() rather than rt.idle() to allow
+    // USER_EXIT to interrupt
+    while rt.is_job_pending().await && !USER_EXIT.load(Ordering::Relaxed) {
+        rt.execute_pending_job()
+            .await
+            .map_err(|_| anyhow::anyhow!("JS Runtime Error"))?;
+        // Make sure we yield (possibly not necessary)
+        tokio::task::yield_now().await;
+    }
 
     Ok(())
 }

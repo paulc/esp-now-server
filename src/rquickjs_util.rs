@@ -8,8 +8,6 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::time::Duration;
 
-use rustyline::{error::ReadlineError, DefaultEditor};
-
 use rquickjs::{
     function::Rest,
     function::{Async, Func},
@@ -55,14 +53,13 @@ pub fn register_tx_channel<'js, T>(
     f: &str,
 ) -> anyhow::Result<()>
 where
-    T: rquickjs::IntoJs<'js> + rquickjs::FromJs<'js> + Clone + Send + std::fmt::Debug + 'static,
+    T: rquickjs::IntoJs<'js> + rquickjs::FromJs<'js> + Clone + Send + 'static,
 {
     let tx = Arc::new(Mutex::new(tx));
     ctx.globals().set(
         f,
         Func::new(Async(move |ctx, msg: T| {
-            println!("TX >> {:?}", msg);
-            let tx = tx.clone();
+            let tx = tx.clone(); // Need to clone tx to ensure closure is Fn vs FnOnce
             async move {
                 match tx
                     .lock()
@@ -88,7 +85,7 @@ pub fn register_rx_channel<'js, T>(
     f: &str,
 ) -> anyhow::Result<()>
 where
-    T: rquickjs::IntoJs<'js> + rquickjs::FromJs<'js> + Clone + Send + std::fmt::Debug + 'static,
+    T: rquickjs::IntoJs<'js> + rquickjs::FromJs<'js> + Clone + Send + 'static,
 {
     let rx = Arc::new(Mutex::new(rx));
     ctx.globals().set(
@@ -104,11 +101,42 @@ where
                         .recv()
                         .await
                 } {
-                    println!("TX >> {:?}", msg);
                     Ok::<T, rquickjs::Error>(msg)
                 } else {
                     Err::<T, rquickjs::Error>(Exception::throw_message(&ctx, "RX Channel Closed"))
                 }
+            }
+        })),
+    )?;
+    Ok(())
+}
+
+/// Register RX channel callback
+pub fn register_rx_channel_cb<'js, T>(
+    ctx: Ctx<'js>,
+    rx: UnboundedReceiver<T>,
+    f: &str,
+) -> anyhow::Result<()>
+where
+    T: rquickjs::IntoJs<'js> + rquickjs::FromJs<'js> + Clone + Send + 'static,
+{
+    let rx = Arc::new(Mutex::new(Some(rx)));
+    let ctx = ctx.clone();
+    ctx.globals().set(
+        f,
+        Func::new(Async(move |ctx, f: Function<'js>| {
+            let rx = rx.clone(); // Need to clone rx to ensure closure is Fn vs FnOnce
+            async move {
+                let mut rx_guard = rx
+                    .try_lock() // CB holds mutex when registered
+                    .map_err(|_| Exception::throw_message(&ctx, "Mutex Locked (CB Exists)"))?;
+                let mut rx = rx_guard
+                    .take()
+                    .ok_or(Exception::throw_message(&ctx, "CB Already Registered"))?;
+                while let Some(msg) = rx.recv().await {
+                    f.call::<_, ()>((msg,))?;
+                }
+                Ok::<(), rquickjs::Error>(())
             }
         })),
     )?;
@@ -304,7 +332,7 @@ pub async fn run_module(ctx: Ctx<'_>, module: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// REPL
+/// Simple REPL
 pub async fn repl(ctx: Ctx<'_>) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
@@ -324,53 +352,79 @@ pub async fn repl(ctx: Ctx<'_>) -> anyhow::Result<()> {
     }
 }
 
-/// REPL
+/// Readline REPL
 const PROMPT: &str = ">>> ";
 const MULTILINE_PROMPT: &str = "... ";
+const RL_CHANNEL_CAPACITY: usize = 1;
 
-pub async fn repl_rustyline(ctx: Ctx<'_>) -> anyhow::Result<()> {
-    let mut rl = DefaultEditor::new()?;
-    let mut lines = Vec::new();
-    let mut prompt = PROMPT;
-    loop {
-        match rl.readline(prompt) {
-            Ok(line) => {
-                lines.push(line.to_string());
-                let script = lines.join("\n");
-                // Check if we need more input (unmatched braces/parens)
-                if needs_more_input(&script) {
-                    prompt = MULTILINE_PROMPT;
-                } else {
-                    if !script.is_empty() {
-                        rl.add_history_entry(script.as_str())?;
-                        match run_script(ctx.clone(), script).await {
-                            Ok(v) => {
-                                if !v.is_undefined() {
-                                    ctx.globals().set("_", v.clone())?;
-                                    let _ = print_v(ctx.clone(), v);
-                                }
-                            }
-                            Err(e) => eprintln!("{e}"),
+pub async fn repl_rl(ctx: Ctx<'_>) -> anyhow::Result<()> {
+    use rustyline::{error::ReadlineError, DefaultEditor};
+
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<String>(RL_CHANNEL_CAPACITY);
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<()>(RL_CHANNEL_CAPACITY);
+
+    // Need to spawn blocking task as rustyline is sync
+    let input_handle = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let mut rl = DefaultEditor::new()?;
+        let mut lines = Vec::new();
+        let mut prompt = PROMPT;
+        loop {
+            match rl.readline(prompt) {
+                Ok(line) => {
+                    lines.push(line.to_string());
+                    let cmd = lines.join("\n");
+                    // Check if we need more input (unmatched braces/parens)
+                    if needs_more_input(&cmd) {
+                        prompt = MULTILINE_PROMPT;
+                    } else {
+                        if !cmd.is_empty() {
+                            rl.add_history_entry(cmd.as_str())?;
+                        }
+                        if cmd_tx.blocking_send(cmd).is_err() {
+                            // Channel closed
+                            break;
+                        }
+                        // Wait for reply
+                        if reply_rx.blocking_recv().is_none() {
+                            // Channel closed
+                            break;
                         }
                         lines.clear();
-                    }
-                    prompt = PROMPT;
-                };
-            }
-            Err(ReadlineError::Interrupted) => {
-                eprintln!("<CTRL-C>");
-                break;
-            }
-            Err(ReadlineError::Eof) => {
-                eprintln!("<CTRL-D>");
-                break;
-            }
-            Err(e) => {
-                eprintln!("Error: {:?}", e);
-                break;
+                        prompt = PROMPT;
+                    };
+                }
+                Err(ReadlineError::Interrupted) => {
+                    eprintln!("<CTRL-C>");
+                    break;
+                }
+                Err(ReadlineError::Eof) => {
+                    eprintln!("<CTRL-D>");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("[-] Readline Error: {:?}", e);
+                    break;
+                }
             }
         }
+        Ok(())
+    });
+
+    // Get input cmd
+    while let Some(cmd) = cmd_rx.recv().await {
+        match run_script(ctx.clone(), cmd).await {
+            Ok(v) => {
+                if !v.is_undefined() {
+                    ctx.globals().set("_", v.clone())?;
+                    let _ = print_v(ctx.clone(), v);
+                }
+            }
+            Err(e) => eprintln!("[-] Command Channel: {e}"),
+        }
+        reply_tx.send(()).await?;
     }
+
+    let _ = input_handle.await?;
     Ok(())
 }
 
