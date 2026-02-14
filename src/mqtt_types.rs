@@ -116,53 +116,40 @@ impl MqttCommand {
     }
 
     #[qjs(get, rename = "payload")]
-    pub fn get_payload<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+    pub fn get_payload<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<ArrayBuffer<'js>> {
         match self {
             MqttCommand::Publish { payload, .. } => {
-                Ok(ArrayBuffer::new_copy(ctx.clone(), payload)?
-                    .as_value()
-                    .clone())
+                Ok(ArrayBuffer::new_copy(ctx.clone(), payload)?)
             }
-            _ => Ok(rquickjs::Undefined {}.into_value(ctx.clone())),
+            _ => Err(Exception::throw_message(&ctx, "Invalid Type")),
         }
     }
 
     #[qjs(get, rename = "payload_utf8")]
-    pub fn get_payload_utf8<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+    pub fn get_payload_utf8<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<String> {
         match self {
-            MqttCommand::Publish { payload, .. } => {
-                let s = String::from_utf8(payload.clone())?;
-                Ok(rquickjs::String::from_str(ctx.clone(), s.as_str())?
-                    .as_value()
-                    .clone())
-            }
-            _ => Ok(rquickjs::Undefined {}.into_value(ctx.clone())),
+            MqttCommand::Publish { payload, .. } => Ok(String::from_utf8(payload.clone())?),
+            _ => Err(Exception::throw_message(&ctx, "Invalid Type")),
         }
     }
 
     #[qjs(get, rename = "topic")]
-    pub fn get_topic<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+    pub fn get_topic<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<String> {
         match self {
             MqttCommand::Publish { topic, .. }
             | MqttCommand::Subscribe { topic, .. }
-            | MqttCommand::Unsubscribe { topic, .. } => {
-                Ok(rquickjs::String::from_str(ctx.clone(), topic)?
-                    .as_value()
-                    .clone())
-            }
-            MqttCommand::Disconnect => Ok(rquickjs::Undefined {}.into_value(ctx.clone())),
+            | MqttCommand::Unsubscribe { topic, .. } => Ok(topic.clone()),
+            _ => Err(Exception::throw_message(&ctx, "Invalid Type")),
         }
     }
 
     #[qjs(get, rename = "qos")]
-    pub fn get_qos<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+    pub fn get_qos<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<String> {
         match self {
             MqttCommand::Publish { qos, .. } | MqttCommand::Subscribe { qos, .. } => {
-                Ok(rquickjs::String::from_str(ctx.clone(), &qos.to_string())?
-                    .as_value()
-                    .clone())
+                Ok(qos.to_string())
             }
-            _ => Ok(rquickjs::Undefined {}.into_value(ctx.clone())),
+            _ => Err(Exception::throw_message(&ctx, "Invalid Type")),
         }
     }
 

@@ -132,7 +132,7 @@ where
                     .map_err(|_| Exception::throw_message(&ctx, "Mutex Locked (CB Exists)"))?;
                 let mut rx = rx_guard
                     .take()
-                    .ok_or(Exception::throw_message(&ctx, "CB Already Registered"))?;
+                    .ok_or_else(|| Exception::throw_message(&ctx, "CB Already Registered"))?;
                 while let Some(msg) = rx.recv().await {
                     f.call::<_, ()>((msg,))?;
                 }
@@ -143,8 +143,78 @@ where
     Ok(())
 }
 
+/// Register RX channel callback with cancel function
+pub fn register_rx_channel_cb_cancel<'js, T>(
+    ctx: Ctx<'js>,
+    rx: UnboundedReceiver<T>,
+    f: &str,
+) -> anyhow::Result<()>
+where
+    T: rquickjs::IntoJs<'js> + rquickjs::FromJs<'js> + Clone + Send + 'static,
+{
+    // Wrap RX channel in Arc<Mutex<Option<>>> to pass into JS fn (Fn vs FnOnce)
+    let rx = Arc::new(Mutex::new(Some(rx)));
+
+    ctx.globals().set(
+        f,
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, f: Function<'js>| -> rquickjs::Result<Function<'js>> {
+                // Create cancel oneshot channel
+                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                let cancel_tx = Arc::new(Mutex::new(Some(cancel_tx)));
+
+                // Create cancelk function
+                let cancel_f = Function::new(ctx.clone(), move |ctx| -> rquickjs::Result<()> {
+                    cancel_tx
+                        .lock()
+                        .map_err(|_| Exception::throw_message(&ctx, "Mutex Locked"))?
+                        .take()
+                        .ok_or_else(|| Exception::throw_message(&ctx, "Already Cancelled"))?
+                        .send(())
+                        .map_err(|_| Exception::throw_message(&ctx, "Oneshot Error"))
+                })?;
+
+                // Spawn background task
+                ctx.spawn({
+                    let rx = rx.clone();
+                    let mut cancel_rx = cancel_rx;
+                    async move {
+                        match rx.try_lock() {
+                            Ok(mut rx_guard) => {
+                                match rx_guard.take() {
+                                    Some(mut rx) => loop {
+                                        tokio::select! {
+                                            Ok(()) = &mut cancel_rx => {
+                                                // Replace the RX channel in the mutex
+                                                rx_guard.replace(rx);
+                                                break;
+                                            }
+                                            msg = rx.recv() => {
+                                                match msg {
+                                                    Some(msg) => f.call::<_, ()>((msg,)).unwrap(),
+                                                    None => break
+                                                }
+                                            }
+                                        }
+                                    },
+                                    None => eprintln!("Error: CB Already Registered"),
+                                }
+                            }
+                            Err(_) => eprintln!("Error: CB Mutex Locked"),
+                        }
+                    }
+                });
+                Ok(cancel_f)
+            },
+        ),
+    )?;
+    Ok(())
+}
+
 /// Register useful QJS functions
 pub fn register_fns(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    ctx.globals().set("__debug", js_debug)?;
     ctx.globals().set("__print", js_print)?;
     ctx.globals().set("__print_v", js_print_v)?;
     ctx.globals().set("__sleep", js_sleep)?;
@@ -152,6 +222,7 @@ pub fn register_fns(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     ctx.globals().set("__to_buffer", js_to_buffer)?;
     ctx.globals().set("__to_utf8", js_to_utf8)?;
     ctx.globals().set("setTimeout", js_set_timeout)?;
+    ctx.globals().set("setInterval", js_set_interval)?;
     // Add console.log function
     let console = Object::new(ctx.clone())?;
     console.set("log", js_log)?;
@@ -162,6 +233,12 @@ pub fn register_fns(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         Object.defineProperty(ArrayBuffer.prototype, "to_utf8", { value: function() { return __to_utf8(this) }});
     "#)?;
     Ok(())
+}
+
+/// Debug JS Value
+#[rquickjs::function]
+fn debug(v: Value<'_>) {
+    println!("{:?}", v);
 }
 
 /// Print JS String
@@ -177,7 +254,7 @@ pub fn value_to_json<'js>(ctx: Ctx<'js>, v: Value<'js>) -> anyhow::Result<String
     } else {
         ctx.json_stringify(v)?
             .and_then(|s| s.as_string().map(|s| s.to_string().ok()).flatten())
-            .ok_or(anyhow::anyhow!("JSON Error"))
+            .ok_or_else(|| anyhow::anyhow!("JSON Error"))
     }
 }
 
@@ -203,9 +280,9 @@ pub fn json_to_value<'js>(ctx: Ctx<'js>, json: &str) -> anyhow::Result<Value<'js
 #[rquickjs::function]
 pub fn print_v<'js>(ctx: Ctx<'js>, v: Value<'js>) -> rquickjs::Result<()> {
     let output = ctx
-        .json_stringify(v)?
+        .json_stringify(&v)?
         .and_then(|s| s.as_string().map(|s| s.to_string().ok()).flatten())
-        .unwrap_or_else(|| "<ERR>".to_string());
+        .unwrap_or_else(|| format!("{:?}", &v));
     println!("{}", output);
     Ok(())
 }
@@ -233,10 +310,7 @@ fn to_buffer<'js>(ctx: Ctx<'js>, s: String) -> rquickjs::Result<rquickjs::ArrayB
 fn to_utf8<'js>(ctx: Ctx<'js>, a: rquickjs::ArrayBuffer<'js>) -> rquickjs::Result<String> {
     let bytes = a
         .as_bytes()
-        .ok_or(rquickjs::Exception::throw_message(
-            &ctx,
-            "Invalid ArrayBuffer",
-        ))?
+        .ok_or_else(|| rquickjs::Exception::throw_message(&ctx, "Invalid ArrayBuffer"))?
         .to_vec();
     Ok(String::from_utf8(bytes)?)
 }
@@ -251,7 +325,7 @@ fn log<'js>(ctx: Ctx<'js>, args: Rest<Value<'js>>) -> rquickjs::Result<()> {
                 Ok(ctx
                     .json_stringify(a)?
                     .and_then(|s| s.as_string().map(|s| s.to_string().ok()).flatten())
-                    .unwrap_or_else(|| "<ERR>".to_string()))
+                    .unwrap_or_else(|| format!("{:?}", &a)))
             })
             .collect::<Result<Vec<_>, _>>()?
             .join(", ")
@@ -266,16 +340,85 @@ async fn sleep(n: u64) -> rquickjs::Result<()> {
 }
 
 #[rquickjs::function]
-async fn set_timeout<'js>(
-    ctx: Ctx<'js>,
-    f: Function<'js>,
-    n: u64,
+fn set_timeout<'js>(
+    ctx: rquickjs::Ctx<'js>,
+    f: rquickjs::Function<'js>,
+    delay_ms: u64,
     args: Rest<Value<'js>>,
-) -> rquickjs::Result<()> {
-    tokio::time::sleep(Duration::from_secs(n)).await;
+) -> rquickjs::Result<Function<'js>> {
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Need to move cancel_tx into Arc<Mutex<Option>>> to ensure that cancel_f if Fn
+    let cancel_tx = Arc::new(Mutex::new(Some(cancel_tx)));
+    let cancel_f = Function::new(ctx.clone(), move |ctx| -> rquickjs::Result<()> {
+        cancel_tx
+            .lock()
+            .map_err(|_| Exception::throw_message(&ctx, "Mutex Locked"))?
+            .take()
+            .ok_or_else(|| Exception::throw_message(&ctx, "Already Cancelled"))?
+            .send(())
+            .map_err(|_| Exception::throw_message(&ctx, "Oneshot Channel Closed"))
+    })?;
+
     let mut arg = rquickjs::function::Args::new(ctx.clone(), args.len());
     arg.push_args(args.iter())?;
-    f.call_arg(arg)
+
+    let _handle = ctx.spawn({
+        async move {
+            tokio::select! {
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)) => {
+                    let _ = f.call_arg::<()>(arg);
+                }
+                Ok(()) = cancel_rx => {
+                }
+            }
+        }
+    });
+
+    Ok(cancel_f)
+}
+
+#[rquickjs::function]
+fn set_interval<'js>(
+    ctx: rquickjs::Ctx<'js>,
+    f: rquickjs::Function<'js>,
+    delay_ms: u64,
+    args: Rest<Value<'js>>,
+) -> rquickjs::Result<Function<'js>> {
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Need to move cancel_tx into Arc<Mutex<Option<_>>>> to ensure that cancel_f closure is Fn
+    let cancel_tx = Arc::new(Mutex::new(Some(cancel_tx)));
+    let cancel_f = Function::new(ctx.clone(), move |ctx| -> rquickjs::Result<()> {
+        cancel_tx
+            .lock()
+            .map_err(|_| Exception::throw_message(&ctx, "Mutex Locked"))?
+            .take()
+            .ok_or_else(|| Exception::throw_message(&ctx, "Already Cancelled"))?
+            .send(())
+            .map_err(|_| Exception::throw_message(&ctx, "Oneshot Channel Closed"))
+    })?;
+
+    let _handle = ctx.spawn({
+        let ctx = ctx.clone();
+        async move {
+            let mut cancel_rx = cancel_rx;
+            loop {
+                let mut arg = rquickjs::function::Args::new(ctx.clone(), args.len());
+                let _ = arg.push_args(args.iter());
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)) => {
+                        let _ = f.call_arg::<()>(arg);
+                    }
+                    Ok(()) = &mut cancel_rx => {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(cancel_f)
 }
 
 /// Expand script arg to handle literal script, @file or stdin (-)
@@ -419,7 +562,7 @@ pub async fn repl_rl(ctx: Ctx<'_>) -> anyhow::Result<()> {
                     let _ = print_v(ctx.clone(), v);
                 }
             }
-            Err(e) => eprintln!("[-] Command Channel: {e}"),
+            Err(e) => eprintln!("[-] JS Error: {e}"),
         }
         reply_tx.send(()).await?;
     }
@@ -441,7 +584,7 @@ where
     }
     Ok(obj
         .as_function()
-        .ok_or(anyhow::anyhow!("{path} not a function"))?
+        .ok_or_else(|| anyhow::anyhow!("{path} not a function"))?
         .call::<A, rquickjs::Value>(args)?)
 }
 

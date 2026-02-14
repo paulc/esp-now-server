@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use esp_now_server::mqtt_task::{MqttConfig, MqttTask};
 use esp_now_server::mqtt_types::register_mqtt;
 use esp_now_server::rquickjs_util::{
-    call_fn, get_script, json_to_value, register_fns, register_rx_channel_cb, register_tx_channel,
-    repl_rl, run_module, run_script, value_to_json,
+    call_fn, get_script, json_to_value, register_fns, register_rx_channel_cb_cancel,
+    register_tx_channel, repl_rl, run_module, run_script, value_to_json,
 };
 
 use argh::FromArgs;
@@ -102,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
     let rt = AsyncRuntime::new()?;
     let ctx = AsyncContext::full(&rt).await?;
 
-    // Set interrupt handler (XXX this doesnt actually interrupt script eval)
+    // Set interrupt handler - this only seems to be called on ctx.eval() so not actually useful
     rt.set_interrupt_handler(Some(Box::new(|| USER_EXIT.load(Ordering::Relaxed))))
         .await;
 
@@ -116,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
         register_fns(&ctx)?;
         register_mqtt(&ctx)?;
         register_tx_channel(ctx.clone(), command_tx, "mqtt_tx")?;
-        register_rx_channel_cb(ctx.clone(), event_rx, "mqtt_rx_cb")?;
+        register_rx_channel_cb_cancel(ctx.clone(), event_rx, "mqtt_rx_cb")?;
 
         // Run modules
         for module in args.module {
